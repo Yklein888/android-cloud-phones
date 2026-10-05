@@ -1,0 +1,29 @@
+[Unit]
+Description=redroid boot guard (no phone reachable without its proxy)
+Documentation=file:/usr/local/bin/redroid-boot-guard
+# Docker restores unless-stopped containers in ARBITRARY order. A phone that
+# wins the race against its sidecar attaches to a DEAD network namespace and
+# then exits on the host IP, while still looking perfectly healthy. This runs
+# after docker has settled and re-attaches any such phone.
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# Give docker time to finish restoring every container before judging state;
+# checking too early reports phones as broken while they are still coming up.
+ExecStartPre=/bin/sleep 45
+ExecStart=/usr/local/bin/redroid-boot-guard
+TimeoutStartSec=1200
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=redroid-guard
+
+# Deliberately NOT paired with a timer. An earlier periodic watchdog treated
+# its own repair as a new fault and rebuilt the fleet in a loop, driving this
+# 3-core host to load 116. This runs once per boot and exits.
+
+[Install]
+WantedBy=multi-user.target

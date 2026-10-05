@@ -1,0 +1,8 @@
+# redroid phone fleet - one line per phone
+# name|proxy_host|proxy_port|proxy_user|proxy_pass|adb_port|vnc_port|width|height|dpi|fps
+#
+# Install to /etc/redroid-proxy/phones.conf with mode 600, root-owned:
+#   sudo install -m 600 -o root -g root phones.conf /etc/redroid-proxy/phones.conf
+# It holds proxy credentials - never commit the real file.
+new01|proxy.example.com|10024|PROXY_USER|PROXY_PASS|5600|5960|360|640|120|15
+new02|proxy.example.com|10021|PROXY_USER|PROXY_PASS|5601|5961|360|640|120|15

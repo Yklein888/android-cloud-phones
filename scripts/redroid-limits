@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# redroid-limits.sh — apply resource limits to every redroid container, and
+# provide a load-gated staggered starter so bringing phones up never storms
+# the host again.
+#
+# ---------------------------------------------------------------------------
+# WHY THESE SPECIFIC SETTINGS (measured on this host, not guessed)
+#
+# Host: 3 CPU cores, 23 GB RAM, 8 GB swap, cgroup v2.
+# Measured per idle-but-booted phone: 0.26% CPU, 960 MB RSS, peak 1112 MB.
+#
+# The load-116 incident was NOT steady-state cost. A booted phone is nearly
+# free. The cost is the BOOT: zygote preload, dex optimisation and SurfaceFlinger
+# all land at once, and 16 phones booting together on 3 cores produced a run
+# queue of >100.
+#
+# 1. cpu-shares, NOT --cpus
+#    A hard quota (--cpus / cpu.max) makes the kernel FREEZE every thread in
+#    the cgroup once the quota for the 100 ms period is spent. With dozens of
+#    Android threads the budget drains in ~12 ms and the container then stands
+#    still for 88 ms; worse, every capped container's quota refills at the same
+#    instant, so they all become runnable simultaneously — a second thundering
+#    herd every 100 ms (documented CFS bandwidth pathology).
+#    cpu-shares (cpu.weight in v2) is proportional: it only matters under
+#    contention and NEVER throttles. Android boot stays fast when the box is
+#    idle, and degrades gracefully instead of freezing when it is busy.
+#
+# 2. memory limit WITH headroom, and swap allowed
+#    peak was 1112 MB, so 1536 MB leaves ~40% headroom. Exceeding a hard
+#    memory cap means SIGKILL (exit 137) — for an Android container that is a
+#    silent dirty shutdown, so the cap must not be tight.
+#    --memory-swap=2560m lets a phone spill 1 GB to swap rather than die.
+#
+# 3. pids-limit
+#    Android spawns hundreds of threads. A runaway app inside one container
+#    could otherwise exhaust the host's pid space and take down docker itself.
+#
+# 4. oom-score-adj
+#    If the HOST runs out of memory, the kernel should prefer killing a phone
+#    over killing dockerd or sshd.
+#
+# ---------------------------------------------------------------------------
+# WHY STAGGERED START WITH A LOAD GATE
+#
+# Fixed sleeps between starts are not enough: boot cost varies with how many
+# phones are already thrashing. This waits for the 1-minute load average to
+# fall below a ceiling before releasing the next phone, so the host self-paces.
+# A documented equivalent fix took a Proxmox host from load 147 to 12 with no
+# extra hardware.
+#
+# USAGE
+#   redroid-limits.sh apply [name...]     # set limits (no restart needed)
+#   redroid-limits.sh apply --all
+#   redroid-limits.sh start <n>           # start n phones, load-gated
+#   redroid-limits.sh start new05 new07   # start specific ones, load-gated
+#   redroid-limits.sh status              # limits + live usage table
+
+set -uo pipefail
+
+CONF=/etc/redroid-proxy/phones.conf
+
+# --- tunables (measured, see header) ---------------------------------------
+MEM_LIMIT="${REDROID_MEM_LIMIT:-1536m}"
+MEM_SWAP="${REDROID_MEM_SWAP:-2560m}"
+CPU_SHARES="${REDROID_CPU_SHARES:-512}"      # half of docker's 1024 default
+PIDS_LIMIT="${REDROID_PIDS_LIMIT:-4096}"
+SIDECAR_MEM="${REDROID_SIDECAR_MEM:-96m}"
+SIDECAR_SHARES="${REDROID_SIDECAR_SHARES:-1024}"  # networking must not starve
+
+# Load gate: with 3 cores, 1.5/core is busy-but-not-drowning.
+CORES="$(nproc)"
+LOAD_CEIL="${REDROID_LOAD_CEIL:-$(awk -v c="$CORES" 'BEGIN{printf "%.1f", c*1.5}')}"
+MIN_FREE_MB="${REDROID_MIN_FREE_MB:-2048}"
+BOOT_SETTLE="${REDROID_BOOT_SETTLE:-20}"     # grace after each phone
+GATE_TIMEOUT="${REDROID_GATE_TIMEOUT:-300}"  # max wait per phone
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+die() { log "ERROR: $*"; exit 1; }
+
+phones_all() { awk -F'|' '/^new/{print $1}' "$CONF" 2>/dev/null; }
+
+load1() { cut -d' ' -f1 /proc/loadavg; }
+free_mb() { awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo; }
+
+# ---------------------------------------------------------------------------
+# apply limits — docker update changes cgroup values live, no restart
+# ---------------------------------------------------------------------------
+apply_one() {
+  local name="$1" kind="$2" mem shares
+
+  if [[ "$kind" == "sidecar" ]]; then
+    mem="$SIDECAR_MEM"; shares="$SIDECAR_SHARES"
+  else
+    mem="$MEM_LIMIT"; shares="$CPU_SHARES"
+  fi
+
+  sudo docker inspect "$name" >/dev/null 2>&1 || { log "  $name: no such container"; return 1; }
+
+  # --memory-swap must be >= --memory or docker rejects it. Sidecars are tiny
+  # and must never swap (it would add latency to every packet), so they get an
+  # equal value, which disables swap for them.
+  local swap_arg
+  if [[ "$kind" == "sidecar" ]]; then swap_arg="$mem"; else swap_arg="$MEM_SWAP"; fi
+
+  if sudo docker update \
+        --memory "$mem" --memory-swap "$swap_arg" \
+        --cpu-shares "$shares" \
+        --pids-limit "$PIDS_LIMIT" \
+        "$name" >/dev/null 2>&1; then
+    log "  $name: mem=$mem swap=$swap_arg shares=$shares pids=$PIDS_LIMIT"
+  else
+    # A stopped container cannot always take live updates on every driver;
+    # report rather than pretend it worked.
+    log "  $name: docker update FAILED (is it stopped on an old driver?)"
+    return 1
+  fi
+}
+
+cmd_apply() {
+  local targets=()
+  if [[ "${1:-}" == "--all" || $# -eq 0 ]]; then
+    while IFS= read -r n; do targets+=("$n"); done < <(phones_all)
+  else
+    targets=("$@")
+  fi
+  (( ${#targets[@]} )) || die "no phones found in $CONF"
+
+  log "applying limits to ${#targets[@]} phones (+ sidecars)"
+  local rc=0
+  for t in "${targets[@]}"; do
+    apply_one "$t" phone || rc=1
+    apply_one "${t}-net" sidecar || rc=1
+  done
+
+  # Host-side OOM preference: protect dockerd/sshd over phones.
+  for t in "${targets[@]}"; do
+    local pid
+    pid=$(sudo docker inspect -f '{{.State.Pid}}' "$t" 2>/dev/null)
+    if [[ -n "$pid" && "$pid" != "0" ]]; then
+      echo 500 | sudo tee "/proc/$pid/oom_score_adj" >/dev/null 2>&1 || true
+    fi
+  done
+  log "done (rc=$rc)"
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+# load-gated staggered start
+# ---------------------------------------------------------------------------
+wait_for_capacity() {
+  local waited=0
+  while :; do
+    local l f
+    l=$(load1); f=$(free_mb)
+    if awk -v l="$l" -v c="$LOAD_CEIL" 'BEGIN{exit !(l < c)}' && (( f > MIN_FREE_MB )); then
+      return 0
+    fi
+    if (( waited >= GATE_TIMEOUT )); then
+      log "  gate timeout after ${waited}s (load=$l free=${f}MB) — stopping here"
+      return 1
+    fi
+    log "  waiting: load=$l (ceil $LOAD_CEIL) free=${f}MB (min ${MIN_FREE_MB}MB)"
+    sleep 15; waited=$((waited+15))
+  done
+}
+
+start_one() {
+  local name="$1"
+
+  if [[ "$(sudo docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == "true" ]]; then
+    log "  $name: already running"
+    return 0
+  fi
+
+  # The phone joins the sidecar's network namespace, so the sidecar must be up
+  # FIRST and must not be restarted afterwards — a restarted sidecar gets a new
+  # namespace while the phone keeps the dead one (that is the `linkdown` bug).
+  if [[ "$(sudo docker inspect -f '{{.State.Running}}' "${name}-net" 2>/dev/null)" != "true" ]]; then
+    log "  $name: starting sidecar first"
+    sudo docker start "${name}-net" >/dev/null 2>&1 || { log "  $name: sidecar failed"; return 1; }
+    sleep 3
+    if ! sudo docker exec "${name}-net" ip link show tun0 >/dev/null 2>&1; then
+      log "  $name: sidecar has no tun0 — refusing to start phone (it would leak)"
+      return 1
+    fi
+  fi
+
+  sudo docker start "$name" >/dev/null 2>&1 || { log "  $name: start failed"; return 1; }
+  apply_one "$name" phone >/dev/null 2>&1
+  log "  $name: started"
+  sleep "$BOOT_SETTLE"
+}
+
+cmd_start() {
+  local targets=()
+
+  if [[ $# -eq 1 && "$1" =~ ^[0-9]+$ ]]; then
+    # "start 5" = next 5 stopped phones, in name order
+    local want="$1"
+    while IFS= read -r n; do
+      [[ "$(sudo docker inspect -f '{{.State.Running}}' "$n" 2>/dev/null)" == "true" ]] && continue
+      targets+=("$n")
+      (( ${#targets[@]} >= want )) && break
+    done < <(phones_all)
+  elif (( $# > 0 )); then
+    targets=("$@")
+  else
+    die "usage: $0 start <count> | start <name>..."
+  fi
+
+  (( ${#targets[@]} )) || { log "nothing to start"; return 0; }
+
+  log "starting ${#targets[@]} phones, load-gated (ceil=$LOAD_CEIL on $CORES cores)"
+  for t in "${targets[@]}"; do
+    wait_for_capacity || break
+    start_one "$t"
+  done
+  log "load now: $(load1)   free: $(free_mb)MB"
+}
+
+cmd_status() {
+  printf '%-10s %-9s %-10s %-8s %-7s %s\n' NAME STATE MEM_LIMIT SHARES PIDS LIVE_MEM
+  local live
+  live=$(sudo docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' 2>/dev/null)
+  while IFS= read -r n; do
+    local st mem sh pl lm
+    st=$(sudo docker inspect -f '{{.State.Status}}' "$n" 2>/dev/null) || st="absent"
+    mem=$(sudo docker inspect -f '{{.HostConfig.Memory}}' "$n" 2>/dev/null)
+    sh=$(sudo docker inspect -f '{{.HostConfig.CpuShares}}' "$n" 2>/dev/null)
+    pl=$(sudo docker inspect -f '{{.HostConfig.PidsLimit}}' "$n" 2>/dev/null)
+    [[ "$mem" == "0" ]] && mem="UNLIMITED" || mem="$(( ${mem:-0} / 1048576 ))MB"
+    lm=$(awk -v k="$n" '$1==k{print $2}' <<< "$live")
+    printf '%-10s %-9s %-10s %-8s %-7s %s\n' "$n" "${st:-?}" "$mem" "${sh:-0}" "${pl:-0}" "${lm:--}"
+  done < <(phones_all)
+  echo
+  echo "host: load=$(cat /proc/loadavg | cut -d' ' -f1-3)  free=$(free_mb)MB  cores=$CORES"
+}
+
+case "${1:-}" in
+  apply)  shift; cmd_apply "$@" ;;
+  start)  shift; cmd_start "$@" ;;
+  status) cmd_status ;;
+  *) cat <<EOF
+usage: $(basename "$0") <command>
+
+  apply [--all|<name>...]   apply measured resource limits (live, no restart)
+  start <count>|<name>...   start phones one at a time, gated on host load
+  status                    show limits and live usage
+
+tunables via env: REDROID_MEM_LIMIT REDROID_CPU_SHARES REDROID_LOAD_CEIL
+                  REDROID_MIN_FREE_MB REDROID_BOOT_SETTLE
+EOF
+    exit 1 ;;
+esac

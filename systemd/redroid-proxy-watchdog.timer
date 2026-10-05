@@ -1,0 +1,13 @@
+[Unit]
+Description=Run redroid proxy leak watchdog every 5 minutes
+
+[Timer]
+# First run shortly after boot (phones need time to settle), then every 5 min.
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=redroid-proxy-watchdog.service
+
+[Install]
+WantedBy=timers.target

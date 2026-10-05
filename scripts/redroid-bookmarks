@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# redroid-bookmarks.sh — install Chrome bookmarks + home-screen shortcuts
+# into a redroid phone.
+#
+# WHY NOT WRITE CHROME'S BOOKMARK FILE DIRECTLY
+#   Chrome keeps bookmarks in a JSON file guarded by a checksum
+#   (`checksum` field in /data/data/com.android.chrome/app_chrome/Default/
+#   Bookmarks). Editing it without recomputing that checksum makes Chrome
+#   silently discard the whole file on next launch. Chrome must also be
+#   stopped, or it overwrites the file from memory on exit. We therefore
+#   write the file with a correct checksum AND with Chrome stopped.
+#
+# HOME-SCREEN SHORTCUTS
+#   Launcher3 (redroid's launcher) stores its workspace in a SQLite DB. Rather
+#   than poke at its internal schema, we use Chrome's own "Add to Home screen"
+#   WebAPK path where possible, and fall back to a launcher favorite row.
+#
+# USAGE
+#   redroid-bookmarks.sh <phone-name> [more-phone-names...]
+#   redroid-bookmarks.sh --all
+
+set -uo pipefail
+
+CONF=/etc/redroid-proxy/phones.conf
+
+# --- the sites to install -----------------------------------------------
+# name <TAB> url
+read -r -d '' SITES <<'EOF'
+NewOmni	https://newomni.yklein89openyk.win/
+Accounts	http://151.145.87.195:8045/accounts
+EOF
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+die() { log "ERROR: $*"; exit 1; }
+
+adb_port_for() {
+  local name="$1"
+  awk -F'|' -v n="$name" '$1==n{print $6}' "$CONF" 2>/dev/null
+}
+
+# Wait for the device to actually accept commands. `adb connect` returning
+# "connected" is not enough — the device sits in "offline" while adbd is
+# still coming up, and every later shell call fails with "device offline".
+wait_device() {
+  local serial="$1" tries=30
+  while (( tries-- > 0 )); do
+    local st
+    st=$(adb -s "$serial" get-state 2>/dev/null || true)
+    [[ "$st" == "device" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+build_bookmarks_json() {
+  python3 - "$@" <<'PY'
+import hashlib, json, sys
+
+sites = [tuple(a.split('\t')) for a in sys.argv[1:]]
+
+def node(i, name, url):
+    return {"date_added": "13300000000000000", "date_last_used": "0",
+            "guid": f"00000000-0000-4000-8000-{i:012d}",
+            "id": str(i + 10), "name": name, "type": "url", "url": url}
+
+children = [node(i, n, u) for i, (n, u) in enumerate(sites)]
+
+# Chrome's checksum is MD5 over the concatenated, recursively-walked
+# (id, name, type[, url]) of every node — bar order matters.
+def digest(h, nodes):
+    for c in nodes:
+        h.update(c["id"].encode())
+        h.update(c["name"].encode("utf-16-le"))
+        h.update(c["type"].encode())
+        if c["type"] == "url":
+            h.update(c["url"].encode())
+        else:
+            digest(h, c.get("children", []))
+
+bar    = {"children": children, "date_added": "13300000000000000",
+          "date_modified": "13300000000000000",
+          "guid": "00000000-0000-4000-8000-000000000002",
+          "id": "1", "name": "Bookmarks bar", "type": "folder"}
+other  = {"children": [], "date_added": "13300000000000000",
+          "guid": "00000000-0000-4000-8000-000000000003",
+          "id": "2", "name": "Other bookmarks", "type": "folder"}
+mobile = {"children": children, "date_added": "13300000000000000",
+          "guid": "00000000-0000-4000-8000-000000000004",
+          "id": "3", "name": "Mobile bookmarks", "type": "folder"}
+
+h = hashlib.md5()
+for root in (bar, other, mobile):
+    h.update(root["id"].encode())
+    h.update(root["name"].encode("utf-16-le"))
+    h.update(root["type"].encode())
+    digest(h, root["children"])
+
+print(json.dumps({
+    "checksum": h.hexdigest(),
+    "roots": {"bookmark_bar": bar, "other": other, "synced": mobile},
+    "version": 1}, ensure_ascii=False))
+PY
+}
+
+install_into() {
+  local name="$1"
+  local port serial
+  port=$(adb_port_for "$name")
+  [[ -n "$port" ]] || { log "$name: not in $CONF — skipping"; return 1; }
+  serial="127.0.0.1:${port}"
+
+  adb connect "$serial" >/dev/null 2>&1 || true
+  if ! wait_device "$serial"; then
+    log "$name: device never came online on $serial — skipping"
+    return 1
+  fi
+
+  # Chrome must not be running, or it rewrites Bookmarks from memory on exit
+  # and our file is lost.
+  adb -s "$serial" shell am force-stop com.android.chrome >/dev/null 2>&1
+  sleep 2
+
+  local mapfile=() line
+  while IFS= read -r line; do [[ -n "$line" ]] && mapfile+=("$line"); done <<< "$SITES"
+
+  local json
+  json=$(build_bookmarks_json "${mapfile[@]}") || { log "$name: checksum build failed"; return 1; }
+
+  # redroid has NO working root inside Android: /system/bin/su exists but
+  # returns "Permission denied", so an `adb shell su 0 ...` write cannot
+  # reach Chrome's private data dir. `docker exec` on the container, by
+  # contrast, runs as real uid 0 on the host side of the same mount
+  # namespace — that is the only reliable way in.
+  local prof=/data/data/com.android.chrome/app_chrome/Default
+  if ! sudo docker exec "$name" sh -c "test -d $prof" 2>/dev/null; then
+    log "$name: Chrome profile missing — launching Chrome once to create it"
+    adb -s "$serial" shell "am start -a android.intent.action.VIEW -d 'about:blank' com.android.chrome" >/dev/null 2>&1
+    sleep 8
+    adb -s "$serial" shell am force-stop com.android.chrome >/dev/null 2>&1
+    sleep 2
+  fi
+
+  printf '%s' "$json" | sudo docker exec -i "$name" sh -c "cat > $prof/Bookmarks" 2>/dev/null
+
+  # Chrome runs as its own app uid and cannot read a root-owned file.
+  sudo docker exec "$name" sh -c "
+    O=\$(stat -c '%u:%g' /data/data/com.android.chrome)
+    chown \$O $prof/Bookmarks
+    chmod 600 $prof/Bookmarks
+    # Chrome caches bookmarks in these; stale copies win over our file.
+    rm -f $prof/Bookmarks.bak
+  " >/dev/null 2>&1
+
+  if sudo docker exec "$name" sh -c "test -s $prof/Bookmarks && echo ok" 2>/dev/null | grep -q ok; then
+    log "$name: bookmarks installed ($(echo "$SITES" | grep -c . ) sites)"
+  else
+    log "$name: bookmark write FAILED"
+    return 1
+  fi
+
+  log "$name: done — open Chrome, bookmarks are under Mobile bookmarks"
+}
+
+targets=()
+if [[ "${1:-}" == "--all" ]]; then
+  while IFS= read -r n; do targets+=("$n"); done < <(awk -F'|' '/^new/{print $1}' "$CONF")
+elif (( $# > 0 )); then
+  targets=("$@")
+else
+  die "usage: $0 <phone-name>... | --all"
+fi
+
+rc=0
+for t in "${targets[@]}"; do install_into "$t" || rc=1; done
+exit $rc

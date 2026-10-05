@@ -1,0 +1,16 @@
+[Unit]
+Description=redroid proxy leak watchdog (verifies real exit IP, repairs drift)
+Documentation=file:/usr/local/bin/redroid-proxy-watchdog.sh
+After=redroid-proxy.service docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/redroid-proxy-watchdog.sh
+TimeoutStartSec=1200
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=redroid-watchdog
+
+[Install]
+WantedBy=multi-user.target

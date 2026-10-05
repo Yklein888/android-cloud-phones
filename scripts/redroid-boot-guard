@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# redroid-boot-guard.sh — guarantee that no phone is ever reachable without
+# its proxy, across reboots and docker restarts.
+#
+# ---------------------------------------------------------------------------
+# THE LEAK THIS CLOSES
+#
+# Both the phone and its sidecar carry RestartPolicy=unless-stopped, and the
+# phone joins the sidecar's network namespace (`--network container:<x>-net`).
+# Docker restores such containers on boot in ARBITRARY order. When the phone
+# wins the race:
+#
+#   * the phone attaches to the namespace of the sidecar's PREVIOUS run
+#   * that namespace is dead: tun0 shows `linkdown`, routes resolve nowhere
+#   * Android's netd then falls back and traffic exits on the HOST IP
+#   * the container looks perfectly healthy: `Up`, tun0 present, no errors
+#
+# Observed on new01: the sidecar started 72 seconds AFTER the phone and the
+# tunnel was silently dead. A netns handle cannot be re-pointed, so the only
+# repair is to recreate the phone after the sidecar is live.
+#
+# ---------------------------------------------------------------------------
+# WHY A ONESHOT SERVICE AND NOT A PERIODIC WATCHDOG
+#
+# A previous periodic watchdog caused an outage: it treated "sidecar newer than
+# phone" as a fault, repaired it by recreating BOTH, which made the sidecar
+# newer again — so the next tick repaired the same phone forever. Running every
+# 5 minutes across the whole fleet drove the 3-core host to load 116.
+#
+# This runs ONCE at boot, in strict order, serially, and then exits. There is
+# no timer, nothing periodic, and no self-triggering condition: a phone that is
+# already correctly attached is left completely alone.
+#
+# SAFETY: this script never STARTS a phone that the user had deliberately
+# stopped. It only fixes phones docker itself brought up, so a quiet fleet
+# stays quiet.
+
+set -uo pipefail
+
+CONF=/etc/redroid-proxy/phones.conf
+STATE=/var/lib/redroid-proxy
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+
+phones() { awk -F'|' '/^new/{print $1}' "$CONF" 2>/dev/null; }
+
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]; }
+exists()  { docker inspect "$1" >/dev/null 2>&1; }
+
+started_at() { docker inspect -f '{{.State.StartedAt}}' "$1" 2>/dev/null; }
+
+# Is the phone attached to a LIVE namespace?
+#
+# Comparing StartedAt timestamps is what broke the old watchdog: the repair
+# itself made the sidecar newer, which re-triggered the same "fault" forever.
+#
+# Docker's own fields are useless here too: for a `container:` network mode the
+# phone's .NetworkSettings.SandboxKey comes back EMPTY, and .HostConfig.
+# NetworkMode keeps naming the sidecar's container id even after that
+# container has been restarted into a brand-new namespace — same id, different
+# namespace, so it cannot detect staleness.
+#
+# The ground truth is the kernel: /proc/<pid>/ns/net resolves to an inode such
+# as net:[4026534615]. Two processes in the same network namespace report the
+# SAME inode. Comparing those inodes cannot be fooled by restarts or ids.
+netns_fresh() {
+  local phone="$1" side="$2"
+  local pp sp pn sn
+  pp=$(docker inspect -f '{{.State.Pid}}' "$phone" 2>/dev/null)
+  sp=$(docker inspect -f '{{.State.Pid}}' "$side"  2>/dev/null)
+  [[ -n "$pp" && "$pp" != "0" && -n "$sp" && "$sp" != "0" ]] || return 1
+  pn=$(readlink "/proc/$pp/ns/net" 2>/dev/null)
+  sn=$(readlink "/proc/$sp/ns/net" 2>/dev/null)
+  [[ -n "$pn" && "$pn" == "$sn" ]]
+}
+
+# Does the tunnel actually exist and carry a default route?
+tunnel_live() {
+  local side="$1"
+  docker exec "$side" ip link show tun0 2>/dev/null | grep -q 'state UP' || return 1
+  # `linkdown` on the route is the fingerprint of a stale namespace.
+  docker exec "$side" ip route show table 1080 2>/dev/null | grep -q 'dev tun0' || return 1
+  ! docker exec "$side" ip route show table 1080 2>/dev/null | grep -q linkdown
+}
+
+fix_phone() {
+  local n="$1" side="${1}-net"
+
+  # Bring the sidecar up first and let tun2socks establish the tunnel.
+  if ! running "$side"; then
+    log "  $n: starting sidecar"
+    docker start "$side" >/dev/null 2>&1 || { log "  $n: SIDECAR FAILED TO START"; return 1; }
+    sleep 4
+  fi
+
+  local tries=10
+  while (( tries-- > 0 )); do
+    tunnel_live "$side" && break
+    sleep 2
+  done
+  if ! tunnel_live "$side"; then
+    log "  $n: sidecar has no live tunnel — leaving phone STOPPED (would leak)"
+    docker stop -t 5 "$n" >/dev/null 2>&1
+    return 1
+  fi
+
+  # Re-attach the phone. Stop then start is enough: docker re-resolves the
+  # namespace of a `container:` network mode on every start.
+  log "  $n: re-attaching phone to the live namespace"
+  docker stop -t 10 "$n" >/dev/null 2>&1
+  sleep 2
+  docker start "$n" >/dev/null 2>&1 || { log "  $n: PHONE FAILED TO START"; return 1; }
+  sleep 3
+
+  if netns_fresh "$n" "$side"; then
+    log "  $n: OK (namespace matches sidecar)"
+    return 0
+  fi
+  log "  $n: STILL MISMATCHED — stopping it rather than leaking"
+  docker stop -t 5 "$n" >/dev/null 2>&1
+  return 1
+}
+
+main() {
+  mkdir -p "$STATE"
+  log "boot guard: verifying proxy attachment for every RUNNING phone"
+
+  local checked=0 fixed=0 failed=0 skipped=0
+
+  while IFS= read -r n; do
+    local side="${n}-net"
+    exists "$n" || continue
+    exists "$side" || { log "  $n: no sidecar — skipping"; continue; }
+
+    # Deliberately stopped phones stay stopped.
+    if ! running "$n"; then
+      skipped=$((skipped+1))
+      continue
+    fi
+
+    checked=$((checked+1))
+
+    if netns_fresh "$n" "$side" && tunnel_live "$side"; then
+      continue
+    fi
+
+    log "  $n: namespace stale or tunnel dead -> repairing"
+    if fix_phone "$n"; then fixed=$((fixed+1)); else failed=$((failed+1)); fi
+  done < <(phones)
+
+  log "boot guard done: checked=$checked repaired=$fixed failed=$failed stopped=$skipped"
+  (( failed == 0 ))
+}
+
+main "$@"

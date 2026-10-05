@@ -1,0 +1,20 @@
+[Unit]
+Description=redroid proxy sidecars + phones (boot-safe bring-up)
+Documentation=file:/usr/local/bin/redroid-proxy-up.sh
+# Must wait for docker, otherwise every `docker run` fails at boot.
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Bring-up is idempotent, so a retry is always safe.
+ExecStart=/usr/local/bin/redroid-proxy-up.sh
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=redroid-proxy
+
+[Install]
+WantedBy=multi-user.target

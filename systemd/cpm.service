@@ -1,0 +1,24 @@
+[Unit]
+Description=CloudPhone Manager dashboard (redroid fleet UI, port 8002)
+Documentation=file:/root/cpm.py
+# Needs docker for `docker ps/inspect/exec`; without this it starts and every
+# query fails until docker is up.
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/cpm.py
+WorkingDirectory=/root
+Restart=always
+RestartSec=5
+# Previously this ran as a bare process: when it died the dashboard was simply
+# gone with nothing to bring it back, and the page "stopped loading" with no
+# trace of why. Restart=always makes that self-healing.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cpm
+
+[Install]
+WantedBy=multi-user.target
