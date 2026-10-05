@@ -37,6 +37,10 @@ IMAGE="${REDROID_IMAGE:-furtif/redroid:12.0.0-rooted-gapps}"
 FINGERPRINT="${REDROID_FINGERPRINT:-redroid/redroid_arm64/redroid_arm64:12/SP1A.210812.016.C2/frank05271443:userdebug/test-keys}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+# Per-phone failure: report and return non-zero so the caller's loop can carry
+# on to the remaining phones. Using die() here would abort the whole run and
+# leave later phones unfixed.
+fail() { echo "ERROR: $*" >&2; return 1; }
 
 [ ${#FINGERPRINT} -le 91 ] || die "fingerprint is ${#FINGERPRINT} chars; must be <= 91"
 
@@ -59,7 +63,7 @@ fix_phone() {
   local name="$1"
   local sidecar="${name}-net"
 
-  docker inspect "$name" >/dev/null 2>&1 || die "no such container: $name"
+  docker inspect "$name" >/dev/null 2>&1 || fail "no such container: $name"
 
   local cur
   cur=$(docker exec "$name" getprop ro.build.fingerprint 2>/dev/null | tr -d '\r' || true)
@@ -88,7 +92,7 @@ fix_phone() {
 
   local volume
   volume=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$name")
-  [ -n "$volume" ] || die "$name has no named /data volume - refusing to rebuild (data would be lost)"
+  [ -n "$volume" ] || fail "$name has no named /data volume - refusing to rebuild (data would be lost)"
 
   # The sidecar must be up and carrying before the phone starts, otherwise the
   # phone boots with no route and exits on the host IP.
@@ -99,7 +103,7 @@ fix_phone() {
       if tunnel_live "$sidecar"; then ok=1; break; fi
       sleep 2
     done
-    [ "$ok" = 1 ] || die "$sidecar has no live tunnel - refusing to start $name (would leak)"
+    [ "$ok" = 1 ] || fail "$sidecar has no live tunnel - refusing to start $name (would leak)"
   fi
 
   echo "$name: rebuilding (fingerprint ${#cur} -> ${#FINGERPRINT} chars, data volume $volume kept)"
@@ -135,7 +139,7 @@ fix_phone() {
   local new
   new=$(docker exec "$name" getprop ro.build.fingerprint 2>/dev/null | tr -d '\r' || true)
   echo "  fingerprint now ${#new} chars"
-  [ ${#new} -le 92 ] || die "$name still has an oversized fingerprint"
+  [ ${#new} -le 92 ] || fail "$name still has an oversized fingerprint"
 
   if docker inspect "$sidecar" >/dev/null 2>&1; then
     local pn sn
@@ -144,7 +148,7 @@ fix_phone() {
       echo "  netns OK (shares $sn)"
     else
       docker stop -t 5 "$name" >/dev/null 2>&1 || true
-      die "$name landed in a stale namespace ($pn vs $sn) - stopped it rather than leak"
+      fail "$name landed in a stale namespace ($pn vs $sn) - stopped it rather than leak"
     fi
   fi
 }

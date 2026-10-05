@@ -58,11 +58,35 @@ Per phone it:
 
 A stale-namespace stop is expected, not a failure: Docker restores containers
 in arbitrary order, so a phone can land in a namespace its sidecar has since
-replaced. Start it again once the sidecar is settled:
+replaced. The script stops that one phone, reports it, and **continues to the
+remaining phones**. Start it again once the sidecar is settled:
 
 ```bash
 sudo docker start <phone>
 ```
+
+### Fleet result (October 2026)
+
+All 17 phones rebuilt with a 91-character fingerprint and verified:
+
+```
+phone   exit IP            phone   exit IP
+new01   99.130.243.65      new11   99.68.65.90
+new02   172.56.104.54      new12   172.56.60.205
+new03   172.58.9.54        new13   99.93.165.141
+new04   99.89.253.108      new15   172.59.210.94
+new05   97.242.140.225     new16   97.200.15.190
+new06   172.58.121.189     new17   65.76.113.154
+new07   172.56.5.146       new19   172.56.26.240
+new08   172.59.190.208     new30   172.58.129.36
+new10   172.59.105.81
+```
+
+17 distinct exit IPs, **zero** on the host address `151.145.87.195`. Chrome
+verified alive on clean phones: 4 processes, 0 crashes, stock APK.
+
+Sidecars are left running when phones are stopped — the tunnels stay warm and
+the namespaces stay stable, which is what keeps the next start leak-free.
 
 Chrome itself installs over adb (the redroid filesystem is read-only, so
 `docker cp` fails):
