@@ -6,6 +6,7 @@ Zero external deps: Python stdlib + docker CLI.
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -24,10 +25,17 @@ PROXY_SERVER = "gw.dataimpulse.com"
 PROXY_USER = "615a2f38b5b07431023c__cr.us"
 PROXY_PASS = "684baca45bb9a6a0"
 SOCKS_PKG = "net.typeblog.socks"
+# Viewer screen size. Containers boot at 360x640@120 (a postage stamp in the
+# browser); `wm size`/`wm density` raise it live on every start.
+SCREEN_W = int(os.environ.get("CPM_SCREEN_W", "720"))
+SCREEN_H = int(os.environ.get("CPM_SCREEN_H", "1280"))
+SCREEN_DPI = int(os.environ.get("CPM_SCREEN_DPI", "240"))
 
 os.makedirs(APK_DIR, exist_ok=True)
 
 _stats_cache = {"t": 0, "data": {}}
+# name -> (timestamp, cumulative usage_usec) for deriving CPU% between samples.
+_cpu_prev = {}
 _stats_lock = threading.Lock()
 
 
@@ -51,8 +59,84 @@ def list_instances():
     return [n for n in out.splitlines() if n.strip()]
 
 
+def _read_cgroup_stats():
+    """Per-container CPU% and memory read straight from cgroup v2 files.
+
+    `docker stats --no-stream` costs ~2.0s on this host because the daemon
+    samples every container twice, 1s apart, to compute a CPU delta. That is
+    75% of the dashboard's response time and it was paid on EVERY refresh (the
+    4s cache could never outlive the 6s refresh interval).
+
+    cgroup v2 exposes the same numbers as plain file reads, so a full fleet
+    sample costs microseconds. CPU% needs two samples, so this keeps the
+    previous reading and derives the delta from it.
+    """
+    out = {}
+    # No -q here: docker ignores --format when --quiet is set and prints a
+    # warning, which leaves every row without a name.
+    rc, ps, _ = sh("docker ps --no-trunc --format '{{.ID}} {{.Names}}'", timeout=10)
+    if rc != 0:
+        return out
+    now = time.time()
+    for line in ps.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        cid, name = parts[0], parts[1]
+        base = f"/sys/fs/cgroup/system.slice/docker-{cid}.scope"
+        try:
+            with open(f"{base}/memory.current") as f:
+                mem = int(f.read().strip())
+        except OSError:
+            continue
+        usec = None
+        try:
+            with open(f"{base}/cpu.stat") as f:
+                for l in f:
+                    if l.startswith("usage_usec"):
+                        usec = int(l.split()[1])
+                        break
+        except OSError:
+            pass
+        cpu = "-"
+        prev = _cpu_prev.get(name)
+        if usec is not None and prev:
+            dt = now - prev[0]
+            if dt > 0.2:
+                # usage_usec is cumulative across all cores.
+                cpu = "%.2f%%" % (((usec - prev[1]) / 1e6) / dt * 100)
+        if usec is not None:
+            _cpu_prev[name] = (now, usec)
+        out[name] = {"cpu": cpu, "mem": "%.0fMiB" % (mem / 1048576)}
+    return out
+
+
+def _stats_refresher():
+    """Keep the stats cache warm off the request path."""
+    while True:
+        try:
+            d = _read_cgroup_stats()
+            if d:
+                with _stats_lock:
+                    _stats_cache["t"] = time.time()
+                    _stats_cache["data"] = d
+        except Exception:
+            pass
+        time.sleep(3)
+
+
 def docker_stats():
-    """Cached docker stats (expensive call)."""
+    """Return the background-refreshed stats snapshot.
+
+    Never blocks a request: a cold cache returns empty and the row shows "-"
+    for a few seconds rather than stalling the whole page.
+    """
+    with _stats_lock:
+        return _stats_cache["data"]
+
+
+def docker_stats_slow():
+    """Original implementation, kept for reference/debugging only."""
     with _stats_lock:
         if time.time() - _stats_cache["t"] < 4:
             return _stats_cache["data"]
@@ -66,6 +150,63 @@ def docker_stats():
         _stats_cache["t"] = time.time()
         _stats_cache["data"] = d
     return d
+
+
+def _cpu_prev_placeholder():
+    pass
+
+
+def inspect_all(names):
+    """Inspect the whole fleet in ONE docker call.
+
+    `docker inspect` accepts many containers at once, so N containers cost one
+    daemon round-trip instead of N (previously up to 3N: the phone, its
+    NetworkMode, then the sidecar for the IP). Sidecars are inspected in the
+    same call so a phone using `--network container:` can borrow its IP without
+    an extra lookup.
+    """
+    if not names:
+        return {}
+    targets = list(names) + [f"{n}-net" for n in names]
+    fmt = ("{{.Name}}|{{.State.Status}}|{{.State.StartedAt}}|"
+           "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}|"
+           "{{.HostConfig.NetworkMode}}|{{.Id}}|"
+           "{{range $p, $v := .NetworkSettings.Ports}}{{$p}}->"
+           "{{range $v}}{{.HostPort}}{{end}} {{end}}")
+    rc, out, _ = sh("docker inspect " + " ".join(targets) +
+                    f" --format '{fmt}' 2>/dev/null", timeout=40)
+    raw, by_id = {}, {}
+    for line in out.splitlines():
+        p = line.split("|")
+        if len(p) < 7:
+            continue
+        nm = p[0].lstrip("/")
+        rec = {"status": p[1], "started": p[2], "ip": p[3],
+               "netmode": p[4], "id": p[5], "ports": p[6]}
+        raw[nm] = rec
+        by_id[p[5]] = rec
+
+    res = {}
+    for n in names:
+        r = raw.get(n)
+        if not r:
+            res[n] = None
+            continue
+        ip = r["ip"]
+        if not ip and r["netmode"].startswith("container:"):
+            # Shares the sidecar's namespace, so the sidecar holds the IP.
+            peer = by_id.get(r["netmode"].split(":", 1)[1]) or raw.get(f"{n}-net")
+            if peer:
+                ip = peer["ip"]
+        adb_port = vnc_port = ""
+        for chunk in r["ports"].split():
+            if chunk.startswith("5555/tcp->"):
+                adb_port = chunk.split("->")[1]
+            elif chunk.startswith("5900/tcp->"):
+                vnc_port = chunk.split("->")[1]
+        res[n] = {"status": r["status"], "started": r["started"], "ip": ip,
+                  "adb_port": adb_port, "vnc_port": vnc_port}
+    return res
 
 
 def inspect_instance(name):
@@ -239,7 +380,79 @@ def _proxy_creds_for(name):
 
 
 def get_android_info(name):
-    """Fingerprint + proxy + boot/health info. Only for running containers."""
+    """Fingerprint + proxy + boot/health info. Only for running containers.
+
+    All probes are issued as ONE `docker exec` running a single shell script,
+    with results delimited by markers. Previously this made 8 separate
+    round-trips per phone; at 17 phones that is 136 exec calls per refresh,
+    each paying container-attach overhead. One call per phone cuts that to 17.
+
+    logcat and dumpsys are the two expensive probes, so they are only included
+    when the caller asks for them (`heavy=True`) — the fleet table does not
+    display their results.
+    """
+    return _android_info(name, heavy=False)
+
+
+def _android_info(name, heavy=False):
+    info = {"android_id": "", "serialno": "", "model": "", "proxy_port": "",
+            "booted": False, "tun": False, "vpn_active": False,
+            "resumed": "", "crashes": 0}
+
+    # getprop/settings are cheap; batching them costs one attach instead of six.
+    script = (
+        'echo "@@boot"; getprop sys.boot_completed; '
+        'echo "@@aid"; settings get secure android_id; '
+        'echo "@@sn"; getprop ro.serialno; '
+        'echo "@@model"; getprop ro.product.model; '
+        'echo "@@tun"; ls /dev/tun 2>/dev/null; '
+        'echo "@@tun0"; ip addr show tun0 2>/dev/null; '
+        f'echo "@@prof"; cat /data/data/{SOCKS_PKG}/shared_prefs/profile.xml 2>/dev/null; '
+    )
+    if heavy:
+        script += ('echo "@@resumed"; dumpsys activity activities 2>/dev/null; '
+                   'echo "@@log"; logcat -d -t 200 2>/dev/null; ')
+    script += 'echo "@@end"'
+
+    rc, out, _ = sh(f"docker exec {name} sh -c {shlex.quote(script)}",
+                    timeout=30 if heavy else 12)
+    if rc != 0:
+        return info
+
+    # Split on the markers; a missing section just stays empty.
+    sec, cur = {}, None
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("@@"):
+            cur = s[2:]
+            sec[cur] = []
+        elif cur:
+            sec[cur].append(line)
+    g = lambda k: "\n".join(sec.get(k, [])).strip()
+
+    info["booted"] = g("boot") == "1"
+    if not info["booted"]:
+        return info
+    info["android_id"] = g("aid")
+    info["serialno"] = g("sn")
+    info["model"] = g("model")
+    info["tun"] = "/dev/tun" in g("tun")
+    info["vpn_active"] = "tun0" in g("tun0")
+
+    m = re.search(r'Defaultport"\s+value="(\d+)"', g("prof"))
+    if m:
+        info["proxy_port"] = m.group(1)
+
+    if heavy:
+        m = re.search(r'mResumedActivity.*?([\w.]+/[\w.$]+)', g("resumed"))
+        if m:
+            info["resumed"] = m.group(1)
+        info["crashes"] = g("log").count("FATAL EXCEPTION")
+    return info
+
+
+def get_android_info_slow(name):
+    """Original one-exec-per-probe version, kept for reference only."""
     info = {"android_id": "", "serialno": "", "model": "", "proxy_port": "",
             "booted": False, "tun": False, "vpn_active": False,
             "resumed": "", "crashes": 0}
@@ -284,12 +497,29 @@ def fix_tun(name):
 
 
 def adb_connect(name, ip=None):
+    """Attach adb to the phone, preferring the HOST adb.
+
+    This used to run `adb connect` inside the ws-scrcpy container, which no
+    longer exists — the step failed with "container ... is not running" on
+    every start, leaving the phone unattached, which is exactly why the viewer
+    sat on a loading screen. The screen streamer on :8004 uses the host adb,
+    so connect there and only fall back to the container if it is present.
+    """
     if ip is None:
         d = inspect_instance(name)
         ip = d["ip"] if d else ""
     if not ip:
         return 1, "", "no ip"
-    return sh(f"docker exec {WS_SCRCPY} adb connect {ip}:5555", timeout=15)
+    # An entry left over as `offline` from a previous run never recovers on its
+    # own; drop it before reconnecting.
+    sh(f"adb disconnect {ip}:5555", timeout=10)
+    rc, out, err = sh(f"adb connect {ip}:5555", timeout=15)
+    if rc == 0 and "connected" in (out or "").lower():
+        return rc, out, err
+    rc2, o2, e2 = sh(f"docker exec {WS_SCRCPY} adb connect {ip}:5555", timeout=15)
+    if rc2 == 0:
+        return rc2, o2, e2
+    return rc, out, err or e2
 
 
 def wait_boot(name, tries=40, delay=3):
@@ -443,6 +673,19 @@ def _bulk_start_worker(targets):
         BULK_START["running"] = False
 
 
+def apply_screen(name):
+    """Raise the phone's screen to SCREEN_W x SCREEN_H at SCREEN_DPI.
+
+    The containers are created with `androidboot.redroid_width=360
+    redroid_height=640 redroid_dpi=120`, which is a tiny picture in the viewer.
+    `wm size` / `wm density` override that at runtime and take effect
+    immediately with no rebuild, but the override is NOT persisted across a
+    container restart, so it has to be re-applied on every start.
+    """
+    dexec(name, f"wm size {SCREEN_W}x{SCREEN_H}", timeout=20)
+    dexec(name, f"wm density {SCREEN_DPI}", timeout=20)
+
+
 def start_instance(name):
     steps = []
     sidecar = f"{name}-net"
@@ -494,6 +737,8 @@ def start_instance(name):
         steps.append(f"props reapplied (SN{aid})")
     rc, o, e = adb_connect(name)
     steps.append(f"adb: {o or e}")
+    apply_screen(name)
+    steps.append(f"screen {SCREEN_W}x{SCREEN_H}@{SCREEN_DPI}")
     return {"ok": True, "steps": steps}
 
 
@@ -737,9 +982,11 @@ def gather_all(details=True):
     """
     names = sorted(list_instances())
     stats = docker_stats()
+    # One docker call for the whole fleet instead of one (or three) per phone.
+    inspected = inspect_all(names)
 
     def build(n):
-        d = inspect_instance(n) or {}
+        d = inspected.get(n) or {}
         row = {"name": n, **d}
         s = stats.get(n, {})
         row["cpu"] = s.get("cpu", "-")
@@ -1480,4 +1727,7 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"CloudPhone Manager on :{PORT}  (ws-scrcpy at {PUBLIC_HOST}:{WS_SCRCPY_PORT})")
+    # Keep CPU/memory stats warm off the request path. Daemon thread so a
+    # shutdown is not blocked by it.
+    threading.Thread(target=_stats_refresher, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
