@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# Rebuild a redroid phone with a short ro.build.fingerprint.
+#
+# WHY
+#   redroid ships ro.build.fingerprint = 103 characters:
+#     redroid/redroid_arm64/redroid_arm64:12/SP1A.210812.016.C2/eng.frank.20240527.144346:userdebug/test-keys
+#   Android's property system caps a value at 92 bytes (PROP_VALUE_MAX). Any
+#   reader using the classic __system_property_get() gets NOTHING back, and
+#   logcat says so plainly:
+#     E libc: The property "ro.build.fingerprint" has a value with length 103
+#            that is too large for __system_property_get()
+#   Chrome reads it while initialising WebView resources, gets a null
+#   Resources object, throws NullPointerException inside
+#   AwResource.getConfigKeySystemUuidMapping, and Chromium turns an unhandled
+#   JNI exception into __builtin_trap() -> "Fatal signal 5 (SIGTRAP)". The app
+#   dies about one second after launch with no useful on-screen error.
+#
+#   This is NOT a Chrome version problem (120 and 154 both die), NOT memory
+#   (dies with 1.5 GB free), NOT the GPU, and NOT the ABI. The other
+#   fingerprint props on the same image (ro.system.*, ro.vendor.*, ...) are
+#   already 91 chars; only ro.build.fingerprint overflows.
+#
+# FIX
+#   redroid accepts ro.* overrides as container arguments, so recreate the
+#   phone passing a 91-character fingerprint that matches the other props.
+#   /data lives in a named volume, so apps, accounts and settings survive.
+#
+# SAFETY
+#   - The proxy sidecar is left running and the phone re-joins its LIVE network
+#     namespace, so the exit IP cannot leak during the rebuild.
+#   - Refuses to start the phone if the sidecar tunnel is not carrying traffic.
+#   - Verifies the namespace inode matches after the rebuild.
+set -euo pipefail
+
+IMAGE="${REDROID_IMAGE:-furtif/redroid:12.0.0-rooted-gapps}"
+# 91 chars - same build id the other *.build.fingerprint props already use.
+FINGERPRINT="${REDROID_FINGERPRINT:-redroid/redroid_arm64/redroid_arm64:12/SP1A.210812.016.C2/frank05271443:userdebug/test-keys}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+[ ${#FINGERPRINT} -le 91 ] || die "fingerprint is ${#FINGERPRINT} chars; must be <= 91"
+
+ns_of() {
+  local pid
+  pid=$(docker inspect -f '{{.State.Pid}}' "$1" 2>/dev/null) || return 1
+  [ -n "$pid" ] && [ "$pid" != "0" ] || return 1
+  readlink "/proc/$pid/ns/net" 2>/dev/null
+}
+
+tunnel_live() {
+  local sc="$1"
+  docker exec "$sc" ip link show tun0 2>/dev/null | grep -q "state UP" || return 1
+  docker exec "$sc" ip route show table 1080 2>/dev/null \
+    | grep -q "dev tun0" || return 1
+  ! docker exec "$sc" ip route show table 1080 2>/dev/null | grep -q linkdown
+}
+
+fix_phone() {
+  local name="$1"
+  local sidecar="${name}-net"
+
+  docker inspect "$name" >/dev/null 2>&1 || die "no such container: $name"
+
+  local cur
+  cur=$(docker exec "$name" getprop ro.build.fingerprint 2>/dev/null | tr -d '\r' || true)
+  if [ -n "$cur" ] && [ ${#cur} -le 92 ]; then
+    echo "$name: fingerprint already ${#cur} chars - skipping"
+    return 0
+  fi
+
+  # Capture the live configuration so the rebuild is faithful.
+  local netmode mem swap shares pids width height dpi fps gpu
+  netmode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$name")
+  mem=$(docker inspect -f '{{.HostConfig.Memory}}' "$name")
+  swap=$(docker inspect -f '{{.HostConfig.MemorySwap}}' "$name")
+  shares=$(docker inspect -f '{{.HostConfig.CpuShares}}' "$name")
+  pids=$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$name")
+
+  read -r width height dpi fps gpu < <(
+    docker inspect -f '{{range .Config.Cmd}}{{println .}}{{end}}' "$name" |
+    awk -F= '
+      /redroid_width/  {w=$2}
+      /redroid_height/ {h=$2}
+      /redroid_dpi/    {d=$2}
+      /redroid_fps/    {f=$2}
+      /redroid_gpu_mode/ {g=$2}
+      END {printf "%s %s %s %s %s", (w?w:360), (h?h:640), (d?d:120), (f?f:15), (g?g:"guest")}')
+
+  local volume
+  volume=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$name")
+  [ -n "$volume" ] || die "$name has no named /data volume - refusing to rebuild (data would be lost)"
+
+  # The sidecar must be up and carrying before the phone starts, otherwise the
+  # phone boots with no route and exits on the host IP.
+  if docker inspect "$sidecar" >/dev/null 2>&1; then
+    docker start "$sidecar" >/dev/null 2>&1 || true
+    local ok=0
+    for _ in $(seq 1 15); do
+      if tunnel_live "$sidecar"; then ok=1; break; fi
+      sleep 2
+    done
+    [ "$ok" = 1 ] || die "$sidecar has no live tunnel - refusing to start $name (would leak)"
+  fi
+
+  echo "$name: rebuilding (fingerprint ${#cur} -> ${#FINGERPRINT} chars, data volume $volume kept)"
+  docker stop -t 15 "$name" >/dev/null
+  docker rm "$name" >/dev/null
+
+  docker run -d --name "$name" \
+    --privileged \
+    --network "$netmode" \
+    --restart unless-stopped \
+    --memory "$mem" --memory-swap "$swap" \
+    --cpu-shares "$shares" --pids-limit "$pids" \
+    -v "${volume}:/data" \
+    "$IMAGE" \
+    "androidboot.redroid_width=$width" \
+    "androidboot.redroid_height=$height" \
+    "androidboot.redroid_dpi=$dpi" \
+    "androidboot.redroid_fps=$fps" \
+    "androidboot.redroid_gpu_mode=$gpu" \
+    androidboot.use_memfd=1 \
+    "ro.build.fingerprint=$FINGERPRINT" >/dev/null
+
+  # Wait for boot, then prove the fix and the proxy are both good.
+  local booted=0
+  for _ in $(seq 1 30); do
+    if [ "$(docker exec "$name" getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+      booted=1; break
+    fi
+    sleep 10
+  done
+  [ "$booted" = 1 ] && echo "  booted" || echo "  WARNING: boot not confirmed"
+
+  local new
+  new=$(docker exec "$name" getprop ro.build.fingerprint 2>/dev/null | tr -d '\r' || true)
+  echo "  fingerprint now ${#new} chars"
+  [ ${#new} -le 92 ] || die "$name still has an oversized fingerprint"
+
+  if docker inspect "$sidecar" >/dev/null 2>&1; then
+    local pn sn
+    pn=$(ns_of "$name" || true); sn=$(ns_of "$sidecar" || true)
+    if [ -n "$pn" ] && [ "$pn" = "$sn" ]; then
+      echo "  netns OK (shares $sn)"
+    else
+      docker stop -t 5 "$name" >/dev/null 2>&1 || true
+      die "$name landed in a stale namespace ($pn vs $sn) - stopped it rather than leak"
+    fi
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <phone> [phone...]      fix the named phones
+       $(basename "$0") --running               fix every running phone
+       $(basename "$0") --all                   fix every phone (starts them)
+
+Replaces redroid's 103-character ro.build.fingerprint with a 91-character one.
+Without this Chrome dies with SIGTRAP about a second after launch.
+/data is preserved; the proxy sidecar stays up and is verified after each fix.
+EOF
+}
+
+case "${1:-}" in
+  ""|-h|--help) usage; exit 0 ;;
+  --running)
+    mapfile -t targets < <(docker ps --format '{{.Names}}' | grep -E '^new[0-9]+$' | sort)
+    ;;
+  --all)
+    mapfile -t targets < <(docker ps -a --format '{{.Names}}' | grep -E '^new[0-9]+$' | sort)
+    ;;
+  *) targets=("$@") ;;
+esac
+
+[ ${#targets[@]} -gt 0 ] || die "no phones matched"
+
+echo "phones to process: ${targets[*]}"
+failed=()
+for t in "${targets[@]}"; do
+  # One phone at a time: a redroid boot is CPU-heavy and this host has 3 cores.
+  # bc is not installed on this host, so compare in integer hundredths.
+  while :; do
+    load_c=$(awk '{printf "%d", $1*100}' /proc/loadavg)
+    ceil_c=$(( $(nproc) * 150 ))
+    [ "$load_c" -lt "$ceil_c" ] && break
+    echo "  waiting for load to fall (now $(cut -d' ' -f1 /proc/loadavg))"
+    sleep 15
+  done
+  fix_phone "$t" || failed+=("$t")
+done
+
+echo
+if [ ${#failed[@]} -eq 0 ]; then
+  echo "done: all ${#targets[@]} phone(s) carry a valid fingerprint"
+else
+  echo "done with failures: ${failed[*]}" >&2
+  exit 1
+fi

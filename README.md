@@ -25,7 +25,53 @@ Verified on 10 phones, each exiting on its own distinct IP.
 - **Before**: 16 simultaneous boots → load 116 on 3 cores, host unusable
 - **After**: load stays 4-6, phones come up sequentially, zero manual intervention
 
-**Production verified**: 17 phones, 10 started via UI, zero leaks detected, load stable, dashboard operational 24/7.
+**Chrome crash fixed at the root** — `ro.build.fingerprint` shortened from 103 to 91 chars:
+- Verified on clean phones: 4 Chrome processes alive, 0 crashes, stock APK unmodified
+- `redroid-fix-fingerprint` rebuilds phones safely, preserving `/data` and verifying the proxy
+- Google OAuth works because this is real Chrome, not a repack or a fork
+
+**Production verified**: 17 phones, zero leaks detected, load stable, dashboard operational 24/7.
+
+## Fixing the Chrome crash (`redroid-fix-fingerprint`)
+
+```bash
+sudo redroid-fix-fingerprint new01          # named phones
+sudo redroid-fix-fingerprint --running      # every running phone
+sudo redroid-fix-fingerprint --all          # every phone
+```
+
+Per phone it:
+1. **Skips** phones whose fingerprint is already ≤ 92 chars — safe to re-run.
+2. Reads the live config (netns, memory, cpu-shares, pids, screen, `/data` volume)
+   so the rebuild is faithful.
+3. **Refuses to continue without a named `/data` volume** — rebuilding without
+   one would destroy apps and accounts.
+4. Starts the sidecar and waits for `tun0` to be `state UP` **and** routing in
+   table 1080 without `linkdown`, before the phone exists. A phone that boots
+   with no route exits on the host IP.
+5. Recreates the phone with the short fingerprint, waits for `sys.boot_completed`.
+6. Verifies the new fingerprint length, then compares `/proc/<pid>/ns/net`
+   inodes between phone and sidecar. **On mismatch it stops the phone** rather
+   than let it leak, and exits non-zero.
+7. Waits for `load < cores × 1.5` between phones — a redroid boot is CPU-heavy
+   and this host has 3 cores.
+
+A stale-namespace stop is expected, not a failure: Docker restores containers
+in arbitrary order, so a phone can land in a namespace its sidecar has since
+replaced. Start it again once the sidecar is settled:
+
+```bash
+sudo docker start <phone>
+```
+
+Chrome itself installs over adb (the redroid filesystem is read-only, so
+`docker cp` fails):
+
+```bash
+adb connect <sidecar-ip>:5555
+adb -s <sidecar-ip>:5555 install -r -t -d -g chrome.apk
+```
+
 
 ## The problem this solves
 
@@ -41,21 +87,51 @@ host's real IP**, logging nothing.
 Every naive health check stayed green: container `Up`, `tun0` present, VPN app
 running. The dashboard said "VPN: on". It was lying.
 
-### 2. "Chrome is too heavy" was actually a hard crash
+### 2. Chrome died on an over-length system property
 
-Chrome died ~1 second after launch with:
+Chrome died ~1 second after launch, every time, on every phone. The visible
+symptom was useless:
 
 ```
-SharedMemoryRegionGetProtectionFlags failed: No such file or directory (2)
-Fatal signal 5 (SIGTRAP) in libchrome.so
+Fatal signal 5 (SIGTRAP), code 1 (TRAP_BRKPT) in libmonochrome.so
+Process com.android.chrome has died: fg TOP
 ```
 
-Not memory pressure — there were 19.9 GB free. `/dev/ashmem` does not exist on
-kernel ≥ 5.18 (removed from mainline), and Chromium's ashmem compat check fails
-even with `androidboot.use_memfd=1`.
+Not memory (19 GB free, no OOM events), not the GPU, not the Chrome version
+(120 and 154 both died), not the ABI. The actual cause was one line in logcat:
 
-Measured once fixed: **Chrome ≈ 199 MB PSS vs Via Browser ≈ 171 MB.** Chrome was
-never the memory problem.
+```
+E libc: The property "ro.build.fingerprint" has a value with length 103
+        that is too large for __system_property_get()
+```
+
+redroid ships a 103-character fingerprint. Android's property system caps a
+value at **92 bytes** (`PROP_VALUE_MAX`), so every reader using the classic
+`__system_property_get()` gets back *nothing*. Chrome reads it while
+initialising WebView resources, receives a null `Resources` object, throws
+`NullPointerException` inside `AwResource.getConfigKeySystemUuidMapping`, and
+Chromium converts the unhandled JNI exception into `__builtin_trap()` — which
+surfaces as SIGTRAP. The crash is three layers removed from its cause.
+
+Every other fingerprint property on the same image (`ro.system.*`,
+`ro.vendor.*`, `ro.odm.*`, `ro.bootimage.*`) is already 91 characters. Only
+`ro.build.fingerprint` overflows.
+
+**Fix:** pass a 91-character fingerprint as a container argument. redroid
+accepts `ro.*` overrides on its command line:
+
+```
+ro.build.fingerprint=redroid/redroid_arm64/redroid_arm64:12/SP1A.210812.016.C2/frank05271443:userdebug/test-keys
+```
+
+`ro.*` properties are immutable at runtime, so `setprop` cannot fix a running
+container — the phone must be recreated. `scripts/redroid-fix-fingerprint`
+does this safely (see below).
+
+The stock Chrome APK needs **no modification**. Repacking it to force arm64
+is a dead end: it breaks the signature chain, and compressing `assets/icudtl.dat`
+or the `.pak` files produces a different crash (`Invalid file descriptor to ICU
+data received`) because Chrome mmaps them straight out of the APK.
 
 ### 3. DNS could not traverse a UDP-less SOCKS5
 
