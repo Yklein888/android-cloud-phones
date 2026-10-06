@@ -62,7 +62,7 @@ CONF=/etc/redroid-proxy/phones.conf
 # --- tunables (measured, see header) ---------------------------------------
 MEM_LIMIT="${REDROID_MEM_LIMIT:-2g}"
 MEM_SWAP="${REDROID_MEM_SWAP:-3g}"
-CPU_SHARES="${REDROID_CPU_SHARES:-512}"      # half of docker's 1024 default
+CPU_SHARES="${REDROID_CPU_SHARES:-1024}"     # normal weight for active phone
 PIDS_LIMIT="${REDROID_PIDS_LIMIT:-4096}"
 SIDECAR_MEM="${REDROID_SIDECAR_MEM:-96m}"
 SIDECAR_SHARES="${REDROID_SIDECAR_SHARES:-1024}"  # networking must not starve

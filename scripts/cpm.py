@@ -556,7 +556,7 @@ GATE_TIMEOUT = int(os.environ.get("CPM_GATE_TIMEOUT", "300"))
 # thundering herd. Shares are proportional and never throttle.
 PHONE_MEM = os.environ.get("CPM_PHONE_MEM", "2g")
 PHONE_SWAP = os.environ.get("CPM_PHONE_SWAP", "3g")
-PHONE_SHARES = os.environ.get("CPM_PHONE_SHARES", "512")
+PHONE_SHARES = os.environ.get("CPM_PHONE_SHARES", "1024")
 PHONE_PIDS = os.environ.get("CPM_PHONE_PIDS", "4096")
 
 
