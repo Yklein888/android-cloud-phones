@@ -675,6 +675,51 @@ def _bulk_start_worker(targets):
         BULK_START["running"] = False
 
 
+def fix_ethernet_dns(name, ip=None):
+    """Repair redroid's static Ethernet config when gateway is 0.0.0.0.
+
+    Docker bridge has no DHCP server. A broken static gateway makes Android
+    install no DNS resolvers, so raw IP works while every hostname fails.
+    Patch the Java writeUTF-encoded gateway for the next Android restart.
+    """
+    if ip is None:
+        d = inspect_instance(name)
+        ip = d["ip"] if d else ""
+    if not ip:
+        return False, "no ip"
+    gw = ip.rsplit(".", 1)[0] + ".1"
+    cfg = "/data/misc/ethernet/ipconfig.txt"
+    rc, out, _ = dexec(
+        name,
+        f"sh -c 'cat {cfg} 2>/dev/null | tr -d \"\\\\000\" | grep -c 0.0.0.0'",
+        timeout=15,
+    )
+    if rc == 0 and out.strip() == "0":
+        return True, "already ok"
+    old = b"\\x00\\x07" + b"0.0.0.0"
+    new = b"\\x00" + bytes([len(gw)]) + gw.encode()
+    data = subprocess.run(
+        f"docker exec {name} sh -c 'cat {cfg}'",
+        shell=True,
+        capture_output=True,
+        timeout=15,
+    ).stdout
+    if old not in data:
+        return True, "no broken gateway found"
+    patched = data.replace(old, new)
+    tmp = f"/tmp/ipconfig-{name}.bin"
+    with open(tmp, "wb") as f:
+        f.write(patched)
+    sh(f"adb -s {ip}:5555 push {tmp} /data/local/tmp/ipconfig.txt", timeout=30)
+    sh(
+        f"docker exec {name} sh -c 'cp /data/local/tmp/ipconfig.txt {cfg} && "
+        f"chown system:system {cfg} && chmod 600 {cfg}'",
+        timeout=20,
+    )
+    os.remove(tmp)
+    return True, f"gateway set to {gw} (restart required)"
+
+
 def apply_screen(name):
     """Raise the phone's screen to SCREEN_W x SCREEN_H at SCREEN_DPI.
 
@@ -744,6 +789,8 @@ def start_instance(name):
         steps.append(f"props reapplied (SN{aid})")
     rc, o, e = adb_connect(name)
     steps.append(f"adb: {o or e}")
+    ok_dns, dns_msg = fix_ethernet_dns(name)
+    steps.append(f"eth dns: {dns_msg}")
     apply_screen(name)
     steps.append(f"screen {SCREEN_W}x{SCREEN_H}@{SCREEN_DPI}")
     return {"ok": True, "steps": steps}
