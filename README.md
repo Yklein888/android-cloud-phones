@@ -407,9 +407,10 @@ browser viewer. Full implementation notes live in
 Important behavior:
 
 - HTTPS selects `wss://`; plain `ws://` is blocked as mixed content.
-- Mobile long-press pastes from the user's real phone clipboard. The
-  Clipboard API read must happen inside `touchend`, which still has transient
-  user activation; a timer started by `touchstart` fails silently.
+- Clipboard paths are gesture-separated: one-finger long-press is Android →
+  Android and opens Android's native Copy/Paste menu; a two-finger tap is
+  outside → Android; a two-finger hold is Android → outside. This prevents
+  Android's own Copy/Paste from colliding with the browser clipboard.
 - The viewer keeps the Android `360x640` 9:16 ratio with `object-fit: contain`.
 - `/copy` uses a deterministic ADB/CDP forward. Python `hash(device_ip)` is
   forbidden because its value changes after every Python restart.

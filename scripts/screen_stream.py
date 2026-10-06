@@ -254,6 +254,23 @@ class ScreenStreamer:
         adb(device_ip, f"shell input swipe {x1} {y1} {x2} {y2} {dur}", timeout=5)
         return web.json_response({'ok': True})
 
+    async def handle_longpress(self, request):
+        """Inject a real Android long-press at one point.
+
+        This stays entirely inside Android: its current app owns selection,
+        its native Copy/Paste popup, and its Android clipboard. No browser or
+        host clipboard is read here.
+        """
+        data = await request.json()
+        device_ip = data.get('device')
+        nx, ny = float(data.get('x', 0)), float(data.get('y', 0))
+        w, h = get_resolution(device_ip)
+        x, y = int(nx * w), int(ny * h)
+        # Android recognises a same-point swipe held beyond its long-press
+        # timeout as ACTION_DOWN -> hold -> ACTION_UP.
+        result = adb(device_ip, f"shell input swipe {x} {y} {x} {y} 700", timeout=5)
+        return web.json_response({'ok': result.returncode == 0, 'x': x, 'y': y})
+
     async def handle_key(self, request):
         data = await request.json()
         device_ip = data.get('device')
@@ -503,10 +520,7 @@ class ScreenStreamer:
     </div>
     <input id="mobileKeyboard" type="text" inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" style="position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:none;padding:0;" placeholder="">
 
-    <div id="clipBar" style="display:flex;gap:10px;margin-top:10px;width:100%;max-width:420px;">
-        <button id="pasteToAndroidBtn" style="flex:1;background:#16a34a;color:white;border:none;padding:14px 10px;border-radius:8px;font-weight:700;font-size:15px;">📥 Paste → Android</button>
-        <button id="copyFromAndroidBtn" style="flex:1;background:#2563eb;color:white;border:none;padding:14px 10px;border-radius:8px;font-weight:700;font-size:15px;">📤 Copy ← Android</button>
-    </div>
+    <!-- Android owns Copy/Paste. Long-press directly on the screen opens its native menu. -->
 
     <script>
         const device = "{device_ip}";
@@ -549,38 +563,72 @@ class ScreenStreamer:
         }}
 
         let dragStart = null;
+        let mouseStartTime = 0;
 
-        container.addEventListener('mousedown', (e) => {{ dragStart = getNormCoords(e.clientX, e.clientY); }});
+        // Desktop long-press follows same Android-native path as touch.
+        container.addEventListener('mousedown', (e) => {{
+            dragStart = getNormCoords(e.clientX, e.clientY);
+            mouseStartTime = Date.now();
+        }});
         container.addEventListener('mouseup', async (e) => {{
             if (!dragStart) return;
             const end = getNormCoords(e.clientX, e.clientY);
+            const held = Date.now() - mouseStartTime;
             const dist = Math.hypot(end.clientX - dragStart.clientX, end.clientY - dragStart.clientY);
             showTapFeedback(end.clientX, end.clientY);
-            if (dist < 10) {{
+
+            if (held >= 450 && dist < 10) {{
+                // Ask Android to hold its own finger down. Android then opens
+                // its native Copy/Paste menu and uses Android's clipboard.
+                await fetch('/longpress', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, x: dragStart.nx, y: dragStart.ny}})}});
+            }} else if (dist < 10) {{
                 fetch('/tap', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, x: dragStart.nx, y: dragStart.ny}})}});
+                setTimeout(() => mobileKb.focus(), 30);
             }} else {{
                 fetch('/swipe', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, x1: dragStart.nx, y1: dragStart.ny, x2: end.nx, y2: end.ny, duration_ms: 200}})}});
             }}
             dragStart = null;
         }});
 
-        // Long-press (hold ~450ms without moving) = paste. Same gesture a
-        // phone already uses everywhere else - no button, no popup.
-        //
-        // IMPORTANT: per the HTML spec, 'touchstart' does NOT count as a
-        // user-activation event, only 'touchend' does (confirmed: Mozilla
-        // bug 1778437). A clipboard.readText() fired from a setTimeout
-        // started on touchstart therefore NEVER has activation and always
-        // silently rejects, no matter the delay. The read must happen
-        // inside the touchend handler itself.
+        // Long-press is forwarded to Android itself. The browser never reads
+        // its own clipboard here. Android receives a 700 ms same-point swipe,
+        // which is a real Android long-press and opens Android's native
+        // Copy/Paste menu using Android's own clipboard.
         let touchStartTime = 0;
+        let touchMoved = false;
+
+        let multiTouch = false;
 
         container.addEventListener('touchstart', (e) => {{
+            // Two fingers reserve a clipboard-transfer gesture. One finger
+            // remains exactly Android's native touch/long-press behavior.
+            multiTouch = e.touches.length >= 2;
             const t = e.touches[0];
             dragStart = getNormCoords(t.clientX, t.clientY);
             touchStartTime = Date.now();
+            touchMoved = false;
             e.preventDefault();
         }}, {{passive: false}});
+
+        container.addEventListener('touchmove', (e) => {{
+            if (!dragStart || multiTouch) return;
+            const t = e.touches[0];
+            const p = getNormCoords(t.clientX, t.clientY);
+            if (Math.hypot(p.clientX - dragStart.clientX, p.clientY - dragStart.clientY) >= 10) {{
+                touchMoved = true;
+            }}
+        }}, {{passive: true}});
+
+        async function copyAndroidToOutside() {{
+            // Runs only from a deliberate two-finger user gesture so the
+            // browser permits clipboard.writeText(). The server uses CDP to
+            // read Android's clipboard.
+            const r = await fetch('/copy', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device}})}});
+            const d = await r.json();
+            if (!d.text) throw new Error('Android clipboard is empty');
+            await navigator.clipboard.writeText(d.text);
+            if (navigator.vibrate) navigator.vibrate([30, 40, 30]);
+        }}
 
         container.addEventListener('touchend', async (e) => {{
             if (!dragStart) return;
@@ -588,32 +636,37 @@ class ScreenStreamer:
             const t = e.changedTouches[0];
             const end = getNormCoords(t.clientX, t.clientY);
             const dist = Math.hypot(end.clientX - dragStart.clientX, end.clientY - dragStart.clientY);
-
-            if (held >= 450 && dist < 10) {{
-                // Long-press, no movement: paste. This call sits directly
-                // inside the touchend handler so it still has activation.
-                showTapFeedback(t.clientX, t.clientY);
-                try {{
-                    const text = await navigator.clipboard.readText();
-                    if (text) {{
-                        await fetch('/paste', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text}})}});
-                        if (navigator.vibrate) navigator.vibrate(40);
-                    }}
-                }} catch (err) {{ console.log('clipboard read failed:', err); }}
-                dragStart = null;
-                e.preventDefault();
-                return;
-            }}
-
             showTapFeedback(t.clientX, t.clientY);
-            if (dist < 10) {{
+
+            if (multiTouch) {{
+                try {{
+                    if (held >= 450) {{
+                        // Two fingers held: Android clipboard -> phone/PC.
+                        await copyAndroidToOutside();
+                    }} else {{
+                        // Two fingers tapped: phone/PC clipboard -> Android.
+                        const text = await navigator.clipboard.readText();
+                        if (text) await fetch('/paste', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text}})}});
+                        if (navigator.vibrate) navigator.vibrate(35);
+                    }}
+                }} catch (err) {{ console.log('clipboard transfer failed:', err); }}
+            }} else if (held >= 450 && !touchMoved && dist < 10) {{
+                // One finger held: Android owns this gesture and its clipboard.
+                await fetch('/longpress', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, x: dragStart.nx, y: dragStart.ny}})}});
+            }} else if (dist < 10) {{
                 fetch('/tap', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, x: dragStart.nx, y: dragStart.ny}})}});
+                // Normal tap opens the user's real mobile keyboard. Long-press
+                // deliberately skips this so Android's menu stays visible.
+                setTimeout(() => mobileKb.focus(), 30);
             }} else {{
                 fetch('/swipe', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, x1: dragStart.nx, y1: dragStart.ny, x2: end.nx, y2: end.ny, duration_ms: 200}})}});
             }}
             dragStart = null;
+            multiTouch = false;
             e.preventDefault();
         }}, {{passive: false}});
+
+        container.addEventListener('touchcancel', () => {{ dragStart = null; multiTouch = false; }});
 
         async function sendKey(key) {{
             await fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key}})}});
@@ -623,28 +676,13 @@ class ScreenStreamer:
             await fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key: 'openapp:' + packageName + '/' + activityName}})}});
         }}
 
-        // Touch-first paste: reads the phone/PC's real OS clipboard via the
-        // Clipboard API (works now that this page is served over HTTPS) and
-        // sends it straight to Android - one tap, no text field, no typing.
-        document.getElementById('pasteToAndroidBtn').addEventListener('click', async () => {{
-            const btn = document.getElementById('pasteToAndroidBtn');
-            try {{
-                const text = await navigator.clipboard.readText();
-                if (!text) {{ btn.textContent = '(clipboard empty)'; setTimeout(() => btn.textContent = '📥 Paste → Android', 1500); return; }}
-                await fetch('/paste', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text}})}});
-                btn.textContent = '✓ Pasted!';
-            }} catch (e) {{
-                btn.textContent = '⚠️ Tap again (grant clipboard)';
-            }}
-            setTimeout(() => btn.textContent = '📥 Paste → Android', 1500);
-        }});
+        // Clipboard stays inside Android. No browser clipboard permission or
+        // extra paste/copy bar is needed for the native long-press path.
 
-
-        // Real mobile keyboard: tapping the screen focuses a hidden input,
-        // which pops the native OS keyboard. Typing streams straight to Android.
+        // Real mobile keyboard: a normal tap focuses a hidden input, which
+        // pops the native OS keyboard. Long-press skips focus so Android's
+        // native Copy/Paste menu is not covered by the keyboard.
         const mobileKb = document.getElementById('mobileKeyboard');
-        container.addEventListener('mouseup', () => setTimeout(() => mobileKb.focus(), 30));
-        container.addEventListener('touchend', () => setTimeout(() => mobileKb.focus(), 30));
 
         mobileKb.addEventListener('input', (e) => {{
             const text = e.target.value;
@@ -661,24 +699,6 @@ class ScreenStreamer:
                 e.preventDefault();
                 fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key: 67}})}});
             }}
-        }});
-
-        document.getElementById('copyFromAndroidBtn').addEventListener('click', async () => {{
-            const btn = document.getElementById('copyFromAndroidBtn');
-            btn.textContent = '⏳ Reading...';
-            try {{
-                const r = await fetch('/copy', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device}})}});
-                const d = await r.json();
-                if (d.text) {{
-                    await navigator.clipboard.writeText(d.text);
-                    btn.textContent = '✓ Copied!';
-                }} else {{
-                    btn.textContent = '(nothing to copy)';
-                }}
-            }} catch (e) {{
-                btn.textContent = '⚠️ Failed';
-            }}
-            setTimeout(() => btn.textContent = '📤 Copy ← Android', 1500);
         }});
 
         // Desktop: Ctrl+V anywhere on the page pastes straight into Android,
@@ -703,6 +723,11 @@ class ScreenStreamer:
             }} else if (e.key === 'Backspace') {{
                 e.preventDefault();
                 fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key: 67}})}});
+            }} else if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'c') {{
+                // Desktop Android -> PC. Explicit chord keeps normal Ctrl+C
+                // available to the browser and avoids accidental clipboard reads.
+                e.preventDefault();
+                copyAndroidToOutside().catch(err => console.log('Android copy failed:', err));
             }}
         }});
 
@@ -720,6 +745,7 @@ async def main():
     app.router.add_get('/', streamer.handle_viewer)
     app.router.add_post('/tap', streamer.handle_tap)
     app.router.add_post('/swipe', streamer.handle_swipe)
+    app.router.add_post('/longpress', streamer.handle_longpress)
     app.router.add_post('/key', streamer.handle_key)
     app.router.add_post('/text', streamer.handle_text)
     app.router.add_post('/paste', streamer.handle_paste)

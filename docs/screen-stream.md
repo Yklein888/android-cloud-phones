@@ -19,17 +19,30 @@ The live service is `screen-stream.service` and runs
 - Drag calls `/swipe`.
 - Text typed on the user's real phone keyboard is captured by the hidden input
   and sent to Android; no visible typing bar is required.
-- Mobile long-press is paste. `touchstart` records the position and time;
-  `touchend` checks for at least 450 ms with less than 10 px movement, then
-  calls `navigator.clipboard.readText()` and posts the text to `/paste`.
-- The clipboard read must stay inside `touchend`. A `setTimeout` started from
-  `touchstart` loses the browser's transient user activation and is rejected
-  by the Clipboard API.
-- The page must be HTTPS. The browser may request clipboard permission once.
-- Desktop `Ctrl+V` uses the page paste event. The visible clipboard buttons
-  remain fallback paths; mobile long-press is the primary paste gesture.
+- One-finger long-press is forwarded to Android as a 700 ms same-point swipe;
+  Android then owns its native selection/Copy/Paste menu and clipboard.
+- The page must be HTTPS. The browser may request clipboard permission once
+  for transfers between the outside device and Android.
 
-## Copy from Android
+## Clipboard gestures
+
+All three clipboard directions are available without a visible toolbar:
+
+- **Android → Android:** hold one finger on text or an editable field. The
+  viewer sends a 700 ms same-point Android touch, so Android itself opens its
+  native selection/Copy/Paste menu and uses Android's own clipboard.
+- **Outside → Android:** on mobile, tap the screen with two fingers; on a
+  desktop, use `Ctrl+V` while the viewer page is open. This sends the user's
+  browser/OS clipboard to Android.
+- **Android → outside:** on mobile, hold two fingers on the screen; on a
+  desktop, use `Ctrl+Shift+C`. The viewer reads Android clipboard through CDP
+  and writes it to the user's browser/OS clipboard.
+
+The two-finger gestures deliberately do not get forwarded to Android, so they
+cannot collide with normal single-finger touch, drag, or long-press behavior.
+A browser may request clipboard permission once for outside transfers.
+
+## Copy from Android implementation
 
 `/copy` uses Chrome DevTools Protocol through an ADB forward. The local port
 is deterministic:
