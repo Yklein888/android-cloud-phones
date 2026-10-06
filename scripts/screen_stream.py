@@ -10,11 +10,11 @@ from aiohttp import web
 from PIL import Image
 
 # Tunables: lower SCALE / quality / target FPS = more speed, less detail
-# At 720x1280 a 0.6 scale looked soft on a full-height view; 0.85 keeps text
-# legible and still costs less than a native-resolution frame.
-SCALE = 0.85         # resize factor applied to native screenshot
-JPEG_QUALITY = 70     # 1-95, lower = smaller/faster
-TARGET_FPS = 15       # loop throttle target
+# The phone stays at 360x640. CSS enlarges the 0.75 JPEG in the browser,
+# preserving 9:16 while keeping ADB capture and transfer light.
+SCALE = 0.75        # resize factor applied to native screenshot
+JPEG_QUALITY = 65     # 1-95, lower = smaller/faster
+TARGET_FPS = 24      # upper bound; ADB capture is the real limit
 
 def adb(device_ip, args, timeout=5):
     cmd = f"adb -s {device_ip}:5555 {args}"
@@ -286,6 +286,97 @@ class ScreenStreamer:
             await self._paste_via_clipboard(device_ip, text)
         return web.json_response({'ok': True})
 
+    _cdp_ports = {}  # device_ip -> local forwarded tcp port
+
+    def _cdp_port(self, device_ip):
+        """One adb forward per device. Deterministic port (not Python's
+        hash(), which is randomized per-process by PYTHONHASHSEED - every
+        service restart picked a different port and silently stacked up
+        dead `adb forward` entries pointing nowhere)."""
+        if device_ip in self._cdp_ports:
+            port = self._cdp_ports[device_ip]
+        else:
+            port = 9222 + (sum(int(x) for x in device_ip.split('.')) % 100)
+            self._cdp_ports[device_ip] = port
+        # Always (re)create the forward - cheap, idempotent, and recovers
+        # from a stale mapping left by a previous process/restart.
+        subprocess.run(f"adb -s {device_ip}:5555 forward tcp:{port} "
+                        "localabstract:chrome_devtools_remote",
+                        shell=True, capture_output=True, timeout=8)
+        return port
+
+    async def handle_copy(self, request):
+        """Read Android's clipboard back to the browser - via Chrome DevTools
+        Protocol, not a UI trick.
+
+        Android 10+ blocks background clipboard reads UNLESS the app has the
+        READ_CLIPBOARD appop explicitly granted (`adb shell appops set
+        com.android.chrome READ_CLIPBOARD allow` - persists across restarts,
+        set once per container). With that grant, Chrome's own devtools
+        socket (always listening at @chrome_devtools_remote) can run
+        `input keyevent 279` (paste into a hidden textarea on a tracked tab)
+        and read the value straight back over CDP - no UI dump, no guessing
+        which app is focused, no flashing a visible helper tab.
+        """
+        import websocket as _ws
+        data = await request.json()
+        device_ip = data.get('device', 'localhost')
+        loop = asyncio.get_event_loop()
+
+        def _do():
+            port = self._cdp_port(device_ip)
+            # Ensure the helper tab exists and get its CDP target id.
+            r = subprocess.run(f"curl -s http://127.0.0.1:{port}/json/list",
+                                shell=True, capture_output=True, timeout=5)
+            try:
+                targets = json.loads(r.stdout or b"[]")
+            except Exception:
+                targets = []
+            target = next((t for t in targets
+                           if t.get("url", "").startswith("http://172.17.0.1:8899")), None)
+            if not target:
+                adb(device_ip, "shell am start -a android.intent.action.VIEW "
+                                "-d 'http://172.17.0.1:8899/' com.android.chrome", timeout=8)
+                time.sleep(1.5)
+                r = subprocess.run(f"curl -s http://127.0.0.1:{port}/json/list",
+                                    shell=True, capture_output=True, timeout=5)
+                targets = json.loads(r.stdout or b"[]")
+                target = next((t for t in targets
+                               if t.get("url", "").startswith("http://172.17.0.1:8899")), None)
+            if not target:
+                return ""
+            ws_url = target["webSocketDebuggerUrl"]
+
+            # Bring Chrome's task to front (needed for the paste keyevent to
+            # land - Android only delivers key events to the focused app)
+            # without relaunching the URL (which would steal a NEW tab).
+            adb(device_ip, "shell am start -n com.android.chrome/"
+                            "com.google.android.apps.chrome.Main", timeout=8)
+            time.sleep(0.6)
+
+            ws = _ws.create_connection(ws_url, timeout=5, suppress_origin=True)
+            try:
+                ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+                    "expression": "document.getElementById('b').focus();"
+                                   "document.getElementById('b').value=''",
+                }}))
+                ws.recv()
+
+                adb(device_ip, "shell input keyevent 279", timeout=5)  # KEYCODE_PASTE
+                time.sleep(0.35)
+
+                ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {
+                    "expression": "document.getElementById('b').value",
+                    "returnByValue": True,
+                }}))
+                resp = json.loads(ws.recv())
+                return resp.get("result", {}).get("result", {}).get("value", "") or ""
+            finally:
+                ws.close()
+
+        text = await loop.run_in_executor(None, _do)
+        return web.json_response({'ok': True, 'text': text})
+
     async def handle_paste(self, request):
         """Set Android clipboard to given text and simulate a paste (Ctrl+V / long-press paste).
         Works for any Unicode text, bypassing 'input text' ASCII limits."""
@@ -356,8 +447,15 @@ class ScreenStreamer:
            tiny no matter how large the phone's resolution was. */
         #screen {{ display: block; height: calc(100vh - 150px); width: auto;
                    max-width: 100%; image-rendering: auto; pointer-events: none; }}
+        /* Mobile used to force width:100% / height:auto here, which threw
+           away the phone's real aspect ratio and stretched every frame
+           sideways - that was the "way too big / out of proportion" bug.
+           object-fit:contain keeps the image letterboxed at its native
+           360:640 ratio inside the same box instead of distorting it. */
         @media (max-width: 700px) {{
-            #screen {{ width: 100%; height: auto; }}
+            #container {{ width: 100%; max-height: calc(100vh - 160px); }}
+            #screen {{ width: 100%; height: 100%; max-height: calc(100vh - 160px);
+                       object-fit: contain; }}
         }}
         #status {{
             position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.7);
@@ -403,14 +501,17 @@ class ScreenStreamer:
         <div id="tapFeedback"></div>
         <div id="status"><span class="dot"></span><span id="fps">Connecting...</span></div>
     </div>
-    <div id="pasteBar">
-        <input id="pasteInput" placeholder="Type or paste text here, then click Send →" />
-        <button id="pasteBtn" onclick="sendPaste()">Send</button>
+    <input id="mobileKeyboard" type="text" inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" style="position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:none;padding:0;" placeholder="">
+
+    <div id="clipBar" style="display:flex;gap:10px;margin-top:10px;width:100%;max-width:420px;">
+        <button id="pasteToAndroidBtn" style="flex:1;background:#16a34a;color:white;border:none;padding:14px 10px;border-radius:8px;font-weight:700;font-size:15px;">📥 Paste → Android</button>
+        <button id="copyFromAndroidBtn" style="flex:1;background:#2563eb;color:white;border:none;padding:14px 10px;border-radius:8px;font-weight:700;font-size:15px;">📤 Copy ← Android</button>
     </div>
 
     <script>
         const device = "{device_ip}";
-        const ws = new WebSocket(`ws://${{location.host}}/stream?device=${{device}}`);
+        const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${{wsProto}}//${{location.host}}/stream?device=${{device}}`);
         const img = document.getElementById('screen');
         const container = document.getElementById('container');
         const status = document.getElementById('status');
@@ -463,16 +564,47 @@ class ScreenStreamer:
             dragStart = null;
         }});
 
+        // Long-press (hold ~450ms without moving) = paste. Same gesture a
+        // phone already uses everywhere else - no button, no popup.
+        //
+        // IMPORTANT: per the HTML spec, 'touchstart' does NOT count as a
+        // user-activation event, only 'touchend' does (confirmed: Mozilla
+        // bug 1778437). A clipboard.readText() fired from a setTimeout
+        // started on touchstart therefore NEVER has activation and always
+        // silently rejects, no matter the delay. The read must happen
+        // inside the touchend handler itself.
+        let touchStartTime = 0;
+
         container.addEventListener('touchstart', (e) => {{
             const t = e.touches[0];
             dragStart = getNormCoords(t.clientX, t.clientY);
+            touchStartTime = Date.now();
             e.preventDefault();
         }}, {{passive: false}});
+
         container.addEventListener('touchend', async (e) => {{
             if (!dragStart) return;
+            const held = Date.now() - touchStartTime;
             const t = e.changedTouches[0];
             const end = getNormCoords(t.clientX, t.clientY);
             const dist = Math.hypot(end.clientX - dragStart.clientX, end.clientY - dragStart.clientY);
+
+            if (held >= 450 && dist < 10) {{
+                // Long-press, no movement: paste. This call sits directly
+                // inside the touchend handler so it still has activation.
+                showTapFeedback(t.clientX, t.clientY);
+                try {{
+                    const text = await navigator.clipboard.readText();
+                    if (text) {{
+                        await fetch('/paste', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text}})}});
+                        if (navigator.vibrate) navigator.vibrate(40);
+                    }}
+                }} catch (err) {{ console.log('clipboard read failed:', err); }}
+                dragStart = null;
+                e.preventDefault();
+                return;
+            }}
+
             showTapFeedback(t.clientX, t.clientY);
             if (dist < 10) {{
                 fetch('/tap', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, x: dragStart.nx, y: dragStart.ny}})}});
@@ -491,18 +623,89 @@ class ScreenStreamer:
             await fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key: 'openapp:' + packageName + '/' + activityName}})}});
         }}
 
-        async function sendPaste() {{
-            const input = document.getElementById('pasteInput');
-            const text = input.value;
-            if (!text) return;
-            await fetch('/paste', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text}})}});
-            input.value = '';
-            input.focus();
-        }}
-
-        document.getElementById('pasteInput').addEventListener('keydown', (e) => {{
-            if (e.key === 'Enter') {{ e.preventDefault(); sendPaste(); }}
+        // Touch-first paste: reads the phone/PC's real OS clipboard via the
+        // Clipboard API (works now that this page is served over HTTPS) and
+        // sends it straight to Android - one tap, no text field, no typing.
+        document.getElementById('pasteToAndroidBtn').addEventListener('click', async () => {{
+            const btn = document.getElementById('pasteToAndroidBtn');
+            try {{
+                const text = await navigator.clipboard.readText();
+                if (!text) {{ btn.textContent = '(clipboard empty)'; setTimeout(() => btn.textContent = '📥 Paste → Android', 1500); return; }}
+                await fetch('/paste', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text}})}});
+                btn.textContent = '✓ Pasted!';
+            }} catch (e) {{
+                btn.textContent = '⚠️ Tap again (grant clipboard)';
+            }}
+            setTimeout(() => btn.textContent = '📥 Paste → Android', 1500);
         }});
+
+
+        // Real mobile keyboard: tapping the screen focuses a hidden input,
+        // which pops the native OS keyboard. Typing streams straight to Android.
+        const mobileKb = document.getElementById('mobileKeyboard');
+        container.addEventListener('mouseup', () => setTimeout(() => mobileKb.focus(), 30));
+        container.addEventListener('touchend', () => setTimeout(() => mobileKb.focus(), 30));
+
+        mobileKb.addEventListener('input', (e) => {{
+            const text = e.target.value;
+            if (text) {{
+                fetch('/text', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text}})}});
+                e.target.value = '';
+            }}
+        }});
+        mobileKb.addEventListener('keydown', (e) => {{
+            if (e.key === 'Enter') {{
+                e.preventDefault();
+                fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key: 66}})}});
+            }} else if (e.key === 'Backspace' && e.target.value === '') {{
+                e.preventDefault();
+                fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key: 67}})}});
+            }}
+        }});
+
+        document.getElementById('copyFromAndroidBtn').addEventListener('click', async () => {{
+            const btn = document.getElementById('copyFromAndroidBtn');
+            btn.textContent = '⏳ Reading...';
+            try {{
+                const r = await fetch('/copy', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device}})}});
+                const d = await r.json();
+                if (d.text) {{
+                    await navigator.clipboard.writeText(d.text);
+                    btn.textContent = '✓ Copied!';
+                }} else {{
+                    btn.textContent = '(nothing to copy)';
+                }}
+            }} catch (e) {{
+                btn.textContent = '⚠️ Failed';
+            }}
+            setTimeout(() => btn.textContent = '📤 Copy ← Android', 1500);
+        }});
+
+        // Desktop: Ctrl+V anywhere on the page pastes straight into Android,
+        // no focused field needed - reads the OS clipboard directly.
+        document.addEventListener('paste', async (e) => {{
+            if (e.target.id === 'pasteInput') return;
+            e.preventDefault();
+            const text = (e.clipboardData || window.clipboardData).getData('text');
+            if (text) {{
+                await fetch('/paste', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text}})}});
+            }}
+        }});
+
+        document.addEventListener('keydown', (e) => {{
+            if (e.target.id === 'pasteInput' || e.target.id === 'mobileKeyboard') return;
+            if (e.key.length === 1) {{
+                e.preventDefault();
+                fetch('/text', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, text: e.key}})}});
+            }} else if (e.key === 'Enter') {{
+                e.preventDefault();
+                fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key: 66}})}});
+            }} else if (e.key === 'Backspace') {{
+                e.preventDefault();
+                fetch('/key', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{device, key: 67}})}});
+            }}
+        }});
+
     </script>
 </body>
 </html>
@@ -520,6 +723,7 @@ async def main():
     app.router.add_post('/key', streamer.handle_key)
     app.router.add_post('/text', streamer.handle_text)
     app.router.add_post('/paste', streamer.handle_paste)
+    app.router.add_post('/copy', streamer.handle_copy)
 
     runner = web.AppRunner(app)
     await runner.setup()

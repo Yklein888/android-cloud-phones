@@ -398,49 +398,31 @@ ashmem-kernel-6.17/                  patched ashmem sources for kernel 6.x
 `phones.conf` holds proxy credentials — mode `600`, root-owned, **never
 committed**.
 
-## Screen viewer (port 8004) — instant open, large screen
+## Screen viewer (port 8004)
 
-`scripts/screen_stream.py` (systemd: `screen-stream.service`) serves
-`http://<host>:8004/?device=<container-ip>`. Four bugs made a freshly started
-phone sit on a loading screen forever:
+`scripts/screen_stream.py` runs as `screen-stream.service` and serves the
+browser viewer. Full implementation notes live in
+[`docs/screen-stream.md`](docs/screen-stream.md).
 
-1. **The viewer never ran `adb connect`.** The host adb had no entry for the
-   phone, so every `screencap` failed, the loop slept 0.3 s and retried
-   forever, with no error shown. Fixed by `ensure_connected()`, which attaches
-   before the first grab and drops a stale `offline` entry (which never
-   recovers on its own) before reconnecting.
-2. **`cpm.py` attached adb inside the `ws-scrcpy` container**, which no longer
-   exists — every start logged `container ... is not running` and left the
-   phone unattached. `adb_connect()` now uses the host adb and only falls back
-   to the container.
-3. **Silent failure.** The stream now emits
-   `{"type":"status","state":"offline|booting|ready"}` so the page says *Phone
-   is booting…* instead of showing nothing.
-4. **`get_resolution()` read `Physical size`.** `wm size` prints both
-   `Physical size: 360x640` and `Override size: 720x1280`; taking the first
-   match mapped every tap to the wrong coordinate once the screen was raised.
+Important behavior:
 
-**Large screen.** Containers boot with
-`androidboot.redroid_width=360 redroid_height=640 redroid_dpi=120`. `wm size
-720x1280` + `wm density 240` override that live, with no rebuild — but the
-override is lost on container restart, so `start_instance()` re-applies it on
-every start via `apply_screen()` (`CPM_SCREEN_W`/`_H`/`_DPI` to change it).
+- HTTPS selects `wss://`; plain `ws://` is blocked as mixed content.
+- Mobile long-press pastes from the user's real phone clipboard. The
+  Clipboard API read must happen inside `touchend`, which still has transient
+  user activation; a timer started by `touchstart` fails silently.
+- The viewer keeps the Android `360x640` 9:16 ratio with `object-fit: contain`.
+- `/copy` uses a deterministic ADB/CDP forward. Python `hash(device_ip)` is
+  forbidden because its value changes after every Python restart.
+- The viewer uses raw `adb screencap` and a pipelined JPEG loop. On this
+  device, capture takes about 104 ms and the verified live rate is about
+  9 FPS. `TARGET_FPS` is only an upper bound; high-refresh video needs
+  scrcpy/H.264/WebRTC.
+- Fast Android profile: `wm size 360x640`, `wm density 180`, all three Android
+  animation scales set to `0`, and `new01` memory raised to 2 GiB with 3 GiB
+  memory+swap.
 
-**Frame rate.** `screencap` costs ~0.2 s, which caps a sequential
-grab→encode→send loop near 3 fps. Two fixes took it to 6.3 fps at 612x1088:
-
-- Capture frame *N+1* while frame *N* is still being sent (`pending` future).
-- Use screencap's **raw** output instead of `-p`: the device was deflating a
-  PNG and the host inflating it again, just to re-encode as JPEG. Raw is a
-  16-byte header (w, h little-endian) plus RGBA rows, wrapped by
-  `Image.frombuffer` with no decode.
-- `SCALE` 0.6→0.85 and `JPEG_QUALITY` 55→70, since a full-height view made the
-  old settings look soft.
-- `screencap` timeout 2 s→8 s: 2 s was tuned for 360x640 and silently dropped
-  every frame at 720x1280 on a loaded host.
-
-Measured: start via the dashboard = **8 s** to `booted=True` + adb connected +
-screen applied; first frame arrives immediately, no status messages.
+The screen defaults in `scripts/cpm.py` must stay aligned with that profile, or
+future starts can reapply a larger, slower display.
 
 ## Gotchas found the hard way
 

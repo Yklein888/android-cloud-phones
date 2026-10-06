@@ -25,11 +25,13 @@ PROXY_SERVER = "gw.dataimpulse.com"
 PROXY_USER = "615a2f38b5b07431023c__cr.us"
 PROXY_PASS = "684baca45bb9a6a0"
 SOCKS_PKG = "net.typeblog.socks"
-# Viewer screen size. Containers boot at 360x640@120 (a postage stamp in the
-# browser); `wm size`/`wm density` raise it live on every start.
-SCREEN_W = int(os.environ.get("CPM_SCREEN_W", "720"))
-SCREEN_H = int(os.environ.get("CPM_SCREEN_H", "1280"))
-SCREEN_DPI = int(os.environ.get("CPM_SCREEN_DPI", "240"))
+# Fast viewer profile. Keep the physical 9:16 display instead of raising it
+# to 720x1280: ADB screencap time scales with pixels, while CSS enlarges the
+# JPEG in the browser without distortion. Density 180 also prevents oversized
+# Android text. `wm size`/`wm density` are re-applied on every start.
+SCREEN_W = int(os.environ.get("CPM_SCREEN_W", "360"))
+SCREEN_H = int(os.environ.get("CPM_SCREEN_H", "640"))
+SCREEN_DPI = int(os.environ.get("CPM_SCREEN_DPI", "180"))
 
 os.makedirs(APK_DIR, exist_ok=True)
 
@@ -552,8 +554,8 @@ GATE_TIMEOUT = int(os.environ.get("CPM_GATE_TIMEOUT", "300"))
 # kernel FREEZE all threads in the cgroup once the 100 ms budget is spent,
 # and every capped container's quota refills on the same tick — a second
 # thundering herd. Shares are proportional and never throttle.
-PHONE_MEM = os.environ.get("CPM_PHONE_MEM", "1536m")
-PHONE_SWAP = os.environ.get("CPM_PHONE_SWAP", "2560m")
+PHONE_MEM = os.environ.get("CPM_PHONE_MEM", "2g")
+PHONE_SWAP = os.environ.get("CPM_PHONE_SWAP", "3g")
 PHONE_SHARES = os.environ.get("CPM_PHONE_SHARES", "512")
 PHONE_PIDS = os.environ.get("CPM_PHONE_PIDS", "4096")
 
@@ -684,6 +686,11 @@ def apply_screen(name):
     """
     dexec(name, f"wm size {SCREEN_W}x{SCREEN_H}", timeout=20)
     dexec(name, f"wm density {SCREEN_DPI}", timeout=20)
+    # Remove Android UI animation delay; this is persistent in the container
+    # settings DB and re-applied after every start for deterministic latency.
+    for setting in ("window_animation_scale", "transition_animation_scale",
+                    "animator_duration_scale"):
+        dexec(name, f"settings put global {setting} 0", timeout=10)
 
 
 def start_instance(name):
@@ -1687,6 +1694,18 @@ class H(BaseHTTPRequestHandler):
                 f"docker exec {WS_SCRCPY} adb -s {ip}:5555 shell {shlex.quote(cmd)}",
                 timeout=40)
             return self._send(200, {"out": o[-20000:], "err": e[-2000:], "rc": rc})
+
+        if u.path == "/api/clipboard":
+            # Paste TO Android clipboard
+            d = self._body()
+            device = d.get("device", "")
+            text = d.get("text", "")
+            if not device or not text:
+                return self._send(400, {"ok": False, "msg": "device and text required"})
+            # Use ADB input text - more reliable than clipboard on redroid
+            safe_text = text.replace("'", "").replace('"', '').replace('\\', '')
+            rc, o, e = sh(f"adb -s {device}:5555 shell input text '{safe_text}'", timeout=10)
+            return self._send(200, {"ok": rc == 0, "msg": e or "pasted"})
 
         if u.path == "/api/apk":
             ctype = self.headers.get("Content-Type", "")
